@@ -1,0 +1,1048 @@
+#!/usr/bin/env python3
+"""
+claw — NanoClaw CLI
+Run a NanoClaw agent container from the command line.
+
+Usage:
+  claw "What is 2+2?"
+  claw -g <channel_name> "Review this code"
+  claw -g "<channel name with spaces>" "What's the latest issue?"
+  claw -j "<chatJid>" "Hello"
+  claw -g <channel_name> -s <session-id> "Continue"
+  claw -i "Start an interactive session"
+  claw -i -g <channel_name> "Hello, I have questions..."
+  claw --list-groups
+  echo "prompt text" | claw --pipe -g <channel_name>
+  cat prompt.txt | claw --pipe
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ── Globals ─────────────────────────────────────────────────────────────────
+
+VERBOSE = False
+
+def dbg(*args):
+    if VERBOSE:
+        print("»", *args, file=sys.stderr)
+
+# ── Config ──────────────────────────────────────────────────────────────────
+
+def _find_nanoclaw_dir() -> Path:
+    """Locate the NanoClaw installation directory.
+
+    Resolution order:
+    1. NANOCLAW_DIR env var
+    2. The directory containing this script (if it looks like a NanoClaw install)
+    3. ~/src/nanoclaw (legacy default)
+    """
+    if env := os.environ.get("NANOCLAW_DIR"):
+        return Path(env).expanduser()
+    # If this script lives inside the NanoClaw tree (e.g. scripts/claw), walk up
+    here = Path(__file__).resolve()
+    for parent in [here.parent, here.parent.parent]:
+        if (parent / "store" / "messages.db").exists() or (parent / ".env").exists():
+            return parent
+    return Path.home() / "src" / "nanoclaw"
+
+NANOCLAW_DIR = _find_nanoclaw_dir()
+DB_PATH      = NANOCLAW_DIR / "store" / "messages.db"
+ENV_FILE     = NANOCLAW_DIR / ".env"
+IMAGE        = "nanoclaw-agent:latest"
+SESSION_DIR  = NANOCLAW_DIR / "data" / "claw-sessions"
+
+SECRET_KEYS = [
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "OLLAMA_HOST",
+]
+
+# ── Compaction Config ─────────────────────────────────────────────────────────
+
+COMPACTION_CONFIG_PATH = Path.home() / ".config" / "nanoclaw" / "compaction-config.json"
+
+DEFAULT_COMPACTION_CONFIG = {
+    "enabled": True,
+    "policies": [
+        {
+            "type": "token_threshold",
+            "threshold_percent": 80,
+            "description": "Default: compress at 80% context usage"
+        }
+    ],
+    "cooldown_minutes": 5,
+    "preserve_recent_turns": 5,
+    "compact_command": "/compact"
+}
+
+# Compaction state (global for thread access)
+compaction_state = {
+    "turn_count": 0,
+    "session_start_time": None,
+    "last_compaction_time": 0,
+    "in_progress": False,
+    "compact_done_event": None  # Will be set to threading.Event when compaction starts
+}
+
+def load_compaction_config() -> dict:
+    """Load compaction configuration from ~/.config/nanoclaw/compaction-config.json"""
+    if not COMPACTION_CONFIG_PATH.exists():
+        # Create default config
+        COMPACTION_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        COMPACTION_CONFIG_PATH.write_text(json.dumps(DEFAULT_COMPACTION_CONFIG, indent=2))
+        dbg(f"Created default compaction config at {COMPACTION_CONFIG_PATH}")
+        return DEFAULT_COMPACTION_CONFIG.copy()
+
+    try:
+        config = json.loads(COMPACTION_CONFIG_PATH.read_text())
+        # Merge with defaults
+        merged = DEFAULT_COMPACTION_CONFIG.copy()
+        merged.update(config)
+        return merged
+    except Exception as e:
+        dbg(f"Error loading compaction config: {e}, using defaults")
+        return DEFAULT_COMPACTION_CONFIG.copy()
+
+
+def evaluate_compaction_policies(config: dict, usage: dict, state: dict) -> tuple[bool, str]:
+    """Evaluate compaction policies and return (should_compact, reason)."""
+    for policy in config.get('policies', []):
+        if policy.get('enabled', True) is False:
+            continue
+
+        policy_type = policy.get('type')
+
+        if policy_type == 'token_threshold':
+            threshold = policy.get('threshold_percent', 80)
+            if usage.get('usagePercent', 0) >= threshold:
+                return True, f"token usage {usage.get('usagePercent', 0):.1f}% >= {threshold}%"
+
+        elif policy_type == 'turn_count':
+            turns = policy.get('turns', 50)
+            if state['turn_count'] >= turns:
+                return True, f"turn count {state['turn_count']} >= {turns}"
+
+        elif policy_type == 'session_duration':
+            interval = policy.get('interval_minutes', 60)
+            if state['session_start_time']:
+                elapsed = (datetime.now(timezone.utc).timestamp() - state['session_start_time']) / 60
+                if elapsed >= interval:
+                    return True, f"session duration {elapsed:.1f}min >= {interval}min"
+
+        elif policy_type == 'combined':
+            conditions = policy.get('conditions', {})
+            logic = policy.get('logic', 'and')
+            results = []
+
+            if 'token_threshold_percent' in conditions:
+                results.append(usage.get('usagePercent', 0) >= conditions['token_threshold_percent'])
+            if 'turn_count' in conditions:
+                results.append(state['turn_count'] >= conditions['turn_count'])
+            if 'session_duration_minutes' in conditions:
+                if state['session_start_time']:
+                    elapsed = (datetime.now(timezone.utc).timestamp() - state['session_start_time']) / 60
+                    results.append(elapsed >= conditions['session_duration_minutes'])
+
+            if len(results) > 0:
+                if logic == 'and' and all(results):
+                    return True, "combined policy (AND) satisfied"
+                elif logic == 'or' and any(results):
+                    return True, "combined policy (OR) satisfied"
+
+    return False, ""
+
+
+def compaction_monitor(folder: str, ipc_dir: Path, config: dict, stop_event: threading.Event):
+    """Monitor usage and trigger compaction based on policies."""
+    global compaction_state
+
+    dbg("Compaction monitor thread started")
+
+    while not stop_event.is_set():
+        time.sleep(2)  # Poll interval
+
+        if not config.get('enabled', True):
+            continue
+
+        if compaction_state['in_progress']:
+            continue
+
+        # Check cooldown
+        now = datetime.now(timezone.utc).timestamp()
+        cooldown_seconds = config.get('cooldown_minutes', 5) * 60
+        if now - compaction_state['last_compaction_time'] < cooldown_seconds:
+            continue
+
+        # Read latest usage snapshot
+        usage_dir = ipc_dir / "usage"
+        if not usage_dir.exists():
+            continue
+
+        usage_files = sorted(usage_dir.glob("*.json"), reverse=True)
+        if not usage_files:
+            continue
+
+        try:
+            usage = json.loads(usage_files[0].read_text())
+        except Exception as e:
+            dbg(f"Error reading usage file: {e}")
+            continue
+
+        # Evaluate policies
+        should_compact, reason = evaluate_compaction_policies(config, usage, compaction_state)
+
+        if should_compact:
+            compaction_state['in_progress'] = True
+            try:
+                trigger_compaction(folder, ipc_dir, config, reason)
+                compaction_state['last_compaction_time'] = datetime.now(timezone.utc).timestamp()
+                # Reset turn count after compaction
+                compaction_state['turn_count'] = 0
+            finally:
+                compaction_state['in_progress'] = False
+
+            # Clean up usage files after compaction
+            for f in usage_files:
+                try:
+                    f.unlink()
+                except:
+                    pass
+
+    dbg("Compaction monitor thread stopped")
+
+
+def trigger_compaction(folder: str, ipc_dir: Path, config: dict, reason: str):
+    """Trigger compaction and notify user."""
+
+    dbg(f"Triggering auto-compaction: {reason}")
+
+    # 1. Send compacting status to TypeScript helper
+    responses_dir = ipc_dir / "responses"
+    responses_dir.mkdir(parents=True, exist_ok=True)
+
+    compacting_response = {
+        "status": "success",
+        "type": "compacting",
+        "message": f"[Auto-compacting session, please wait...]\n[Reason: {reason}]"
+    }
+    resp_file = responses_dir / f"{datetime.now(timezone.utc).timestamp() * 1000:.0f}-compacting.json"
+    resp_file.write_text(json.dumps(compacting_response))
+
+    # 2. Send /compact command to container
+    input_dir = ipc_dir / "input"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    compact_cmd = config.get('compact_command', '/compact')
+    compact_file = input_dir / f"{datetime.now(timezone.utc).timestamp() * 1000:.0f}-compact.json"
+
+    # Atomic write
+    temp_file = compact_file.with_suffix('.tmp')
+    temp_file.write_text(json.dumps({"type": "message", "text": compact_cmd}))
+    temp_file.rename(compact_file)
+
+    dbg(f"Sent compact command: {compact_cmd}")
+
+    # 3. Wait for compaction to complete
+    # The container will process /compact and send a result
+    # stream_stdout will write a response file to responses/
+    # We wait up to 120 seconds for a new response file
+    max_wait = 120
+    start_wait = time.time()
+    initial_files = set(responses_dir.glob("*.json"))
+
+    while time.time() - start_wait < max_wait:
+        time.sleep(0.5)
+        current_files = set(responses_dir.glob("*.json"))
+        new_files = current_files - initial_files
+
+        # Check if there's a new response file from stream_stdout
+        # (not a compacting or compact_done type)
+        for f in new_files:
+            try:
+                data = json.loads(f.read_text())
+                # If it's a normal response (not our status messages), compaction is done
+                if data.get('type') not in ('compacting', 'compact_done'):
+                    dbg(f"Detected compaction response: {f.name}")
+                    # Clean up the response file (will be re-read by TypeScript helper)
+                    # Actually, don't clean up - let TypeScript helper read it
+                    break
+            except:
+                pass
+        else:
+            continue
+        break
+
+    # 4. Send compact_done status
+    done_response = {
+        "status": "success",
+        "type": "compact_done",
+        "message": "[Compaction complete. You may continue.]"
+    }
+    done_file = responses_dir / f"{datetime.now(timezone.utc).timestamp() * 1000:.0f}-compact_done.json"
+    done_file.write_text(json.dumps(done_response))
+
+    dbg("Auto-compaction completed")
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def detect_runtime(preference: str | None) -> str:
+    if preference:
+        dbg(f"runtime: forced to {preference}")
+        return preference
+    for rt in ("container", "docker"):
+        result = subprocess.run(["which", rt], capture_output=True)
+        if result.returncode == 0:
+            dbg(f"runtime: auto-detected {rt} at {result.stdout.decode().strip()}")
+            return rt
+    sys.exit("error: neither 'container' nor 'docker' found. Install one or pass --runtime.")
+
+
+def read_secrets(env_file: Path) -> dict:
+    secrets = {}
+    if not env_file.exists():
+        return secrets
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            key, _, val = line.partition("=")
+            key = key.strip()
+            if key in SECRET_KEYS:
+                secrets[key] = val.strip()
+    return secrets
+
+
+def get_groups(db: Path) -> list[dict]:
+    conn = sqlite3.connect(db)
+    rows = conn.execute(
+        "SELECT jid, name, folder, is_main FROM registered_groups ORDER BY name"
+    ).fetchall()
+    conn.close()
+    return [{"jid": r[0], "name": r[1], "folder": r[2], "is_main": bool(r[3])} for r in rows]
+
+
+def find_group(groups: list[dict], query: str) -> dict | None:
+    q = query.lower()
+    # Exact name match
+    for g in groups:
+        if g["name"].lower() == q or g["folder"].lower() == q:
+            return g
+    # Partial match
+    matches = [g for g in groups if q in g["name"].lower() or q in g["folder"].lower()]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        names = ", ".join(f'"{g["name"]}"' for g in matches)
+        sys.exit(f"error: ambiguous group '{query}'. Matches: {names}")
+    return None
+
+
+def get_session_file(group_folder: str) -> Path:
+    """Return path to session file for a group."""
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    return SESSION_DIR / f"{group_folder}.session"
+
+
+def save_session(group_folder: str, session_id: str) -> None:
+    """Save session ID for a group."""
+    session_file = get_session_file(group_folder)
+    session_file.write_text(session_id)
+    dbg(f"saved session {session_id} to {session_file}")
+
+
+def load_session(group_folder: str) -> str | None:
+    """Load saved session ID for a group."""
+    session_file = get_session_file(group_folder)
+    if session_file.exists():
+        session_id = session_file.read_text().strip()
+        dbg(f"loaded session {session_id} from {session_file}")
+        return session_id
+    return None
+
+
+def build_mounts(folder: str, is_main: bool) -> list[tuple[str, str, bool]]:
+    """Return list of (host_path, container_path, readonly) tuples."""
+    groups_dir  = NANOCLAW_DIR / "groups"
+    data_dir    = NANOCLAW_DIR / "data"
+    sessions_dir = data_dir / "sessions" / folder
+    ipc_dir     = data_dir / "ipc" / folder
+
+    # Ensure required dirs exist
+    group_dir = groups_dir / folder
+    group_dir.mkdir(parents=True, exist_ok=True)
+    (sessions_dir / ".claude").mkdir(parents=True, exist_ok=True)
+    for sub in ("messages", "tasks", "input", "usage", "responses"):
+        (ipc_dir / sub).mkdir(parents=True, exist_ok=True)
+
+    agent_runner_src = sessions_dir / "agent-runner-src"
+    project_agent_runner = NANOCLAW_DIR / "container" / "agent-runner" / "src"
+    if not agent_runner_src.exists() and project_agent_runner.exists():
+        import shutil
+        shutil.copytree(project_agent_runner, agent_runner_src)
+
+    mounts: list[tuple[str, str, bool]] = []
+    if is_main:
+        mounts.append((str(NANOCLAW_DIR), "/workspace/project", True))
+    mounts.append((str(group_dir),           "/workspace/group",    False))
+    mounts.append((str(sessions_dir / ".claude"), "/home/node/.claude", False))
+    mounts.append((str(ipc_dir),             "/workspace/ipc",      False))
+    if agent_runner_src.exists():
+        mounts.append((str(agent_runner_src), "/app/src",           False))
+    return mounts
+
+
+def run_container(runtime: str, image: str, payload: dict,
+                  folder: str | None = None, is_main: bool = False,
+                  timeout: int = 300, persist_session: bool = False) -> None:
+    cmd = [runtime, "run", "-i", "--rm"]
+
+    # Add host.docker.internal resolution for credential proxy access
+    if runtime == "docker":
+        cmd += ["--add-host=host.docker.internal:host-gateway"]
+
+    if folder:
+        for host, container, readonly in build_mounts(folder, is_main):
+            if readonly:
+                cmd += ["--mount", f"type=bind,source={host},target={container},readonly"]
+            else:
+                cmd += ["-v", f"{host}:{container}"]
+
+    # Set ANTHROPIC_BASE_URL to the credential proxy (runs on host at port 3001)
+    # The proxy reads credentials from .env and injects them into API requests
+    proxy_port = os.environ.get("CREDENTIAL_PROXY_PORT", "3001")
+    cmd += ["-e", f"ANTHROPIC_BASE_URL=http://host.docker.internal:{proxy_port}"]
+
+    # Set a dummy API key to satisfy the SDK's credential check.
+    # The actual auth is handled by the credential proxy.
+    cmd += ["-e", "ANTHROPIC_API_KEY=dummy-key-for-sdk-check"]
+
+    cmd.append(image)
+    dbg(f"cmd: {' '.join(cmd)}")
+
+    # Show payload sans secrets
+    if VERBOSE:
+        safe = {k: v for k, v in payload.items() if k != "secrets"}
+        safe["secrets"] = {k: "***" for k in payload.get("secrets", {})}
+        dbg(f"payload: {json.dumps(safe, indent=2)}")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    dbg(f"container pid: {proc.pid}")
+
+    # Write JSON payload and close stdin
+    proc.stdin.write(json.dumps(payload).encode())
+    proc.stdin.close()
+    dbg("stdin closed, waiting for response...")
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    done = threading.Event()
+
+    def stream_stderr():
+        for raw in proc.stderr:
+            line = raw.decode(errors="replace").rstrip()
+            if line.startswith("npm notice"):
+                continue
+            stderr_lines.append(line)
+            print(line, file=sys.stderr)
+
+    def stream_stdout():
+        for raw in proc.stdout:
+            line = raw.decode(errors="replace").rstrip()
+            stdout_lines.append(line)
+            dbg(f"stdout: {line}")
+            # Kill the container as soon as we see the closing sentinel —
+            # the Node.js event loop often keeps the process alive indefinitely.
+            if line.strip() == "---NANOCLAW_OUTPUT_END---":
+                dbg("output sentinel found, terminating container")
+                done.set()
+                try:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        dbg("graceful stop timed out, force killing container")
+                        proc.kill()
+                except ProcessLookupError:
+                    pass
+                return
+
+    t_err = threading.Thread(target=stream_stderr, daemon=True)
+    t_out = threading.Thread(target=stream_stdout, daemon=True)
+    t_err.start()
+    t_out.start()
+
+    # Wait for sentinel or timeout
+    if not done.wait(timeout=timeout):
+        # Also check if process exited naturally
+        t_out.join(timeout=2)
+        if not done.is_set():
+            proc.kill()
+            sys.exit(f"error: container timed out after {timeout}s (no output sentinel received)")
+
+    t_err.join(timeout=5)
+    t_out.join(timeout=5)
+    proc.wait()
+    dbg(f"container done (rc={proc.returncode}), {len(stdout_lines)} stdout lines")
+    stdout = "\n".join(stdout_lines)
+
+    # Parse output block
+    match = re.search(
+        r"---NANOCLAW_OUTPUT_START---\n(.*?)\n---NANOCLAW_OUTPUT_END---",
+        stdout,
+        re.DOTALL,
+    )
+    success = False
+
+    if match:
+        try:
+            data = json.loads(match.group(1))
+            status = data.get("status", "unknown")
+            if status == "success":
+                print(data.get("result", ""))
+                session_id = data.get("newSessionId") or data.get("sessionId")
+                if session_id:
+                    print(f"\n[session: {session_id}]", file=sys.stderr)
+                    # Save session if persistence is enabled
+                    if persist_session and folder:
+                        save_session(folder, session_id)
+                success = True
+            else:
+                print(f"[{status}] {data.get('result', '')}", file=sys.stderr)
+                sys.exit(1)
+        except json.JSONDecodeError:
+            print(match.group(1))
+    else:
+        # No structured output — print raw stdout
+        print(stdout)
+
+    if success:
+        return
+
+    if proc.returncode not in (0, None):
+        sys.exit(proc.returncode)
+
+
+def run_interactive_container(runtime: str, image: str, payload: dict,
+                              folder: str | None = None, is_main: bool = False,
+                              timeout: int = 300, persist_session: bool = False) -> None:
+    """Run container in interactive mode with persistent REPL session."""
+    import atexit
+
+    container_name = f"claw-interactive-{folder or 'default'}"
+
+    # Initialize compaction state for this session
+    compaction_state['turn_count'] = 0
+    compaction_state['session_start_time'] = time.time()
+    compaction_state['last_compaction_time'] = 0
+    compaction_state['in_progress'] = False
+
+    # Load compaction configuration
+    compaction_config = load_compaction_config()
+    dbg(f"Compaction config loaded: enabled={compaction_config.get('enabled', True)}")
+
+    # Create stop event for threads
+    compaction_stop_event = threading.Event()
+
+    # Register cleanup handler for Ctrl+C (capture runtime in closure)
+    rt = runtime
+    def cleanup_container():
+        try:
+            subprocess.run([rt, "rm", "-f", container_name],
+                           capture_output=True, timeout=5)
+        except:
+            pass
+
+    atexit.register(cleanup_container)
+
+    cmd = [runtime, "run", "-i", "--name", container_name]
+
+    # Add host.docker.internal resolution for credential proxy access
+    if runtime == "docker":
+        cmd += ["--add-host=host.docker.internal:host-gateway"]
+
+    if folder:
+        for host, container, readonly in build_mounts(folder, is_main):
+            if readonly:
+                cmd += ["--mount", f"type=bind,source={host},target={container},readonly"]
+            else:
+                cmd += ["-v", f"{host}:{container}"]
+
+    # Set ANTHROPIC_BASE_URL to the credential proxy
+    proxy_port = os.environ.get("CREDENTIAL_PROXY_PORT", "3001")
+    cmd += ["-e", f"ANTHROPIC_BASE_URL=http://host.docker.internal:{proxy_port}"]
+    cmd += ["-e", "ANTHROPIC_API_KEY=dummy-key-for-sdk-check"]
+
+    cmd.append(image)
+    dbg(f"interactive cmd: {' '.join(cmd)}")
+
+    # Show payload sans secrets
+    if VERBOSE:
+        safe = {k: v for k, v in payload.items() if k != "secrets"}
+        safe["secrets"] = {k: "***" for k in payload.get("secrets", {})}
+        dbg(f"payload: {json.dumps(safe, indent=2)}")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    dbg(f"container pid: {proc.pid}")
+
+    # Write initial payload and close stdin
+    # The container expects stdin to close before processing (see readStdin())
+    # Follow-up messages are sent via IPC, not stdin
+    proc.stdin.write(json.dumps(payload).encode())
+    proc.stdin.close()
+    dbg("stdin closed, container running...")
+
+    # IPC directory for follow-up messages
+    ipc_dir = str(NANOCLAW_DIR / "data" / "ipc" / folder) if folder else ""
+
+    # Clean up any stale IPC files from previous runs
+    if folder:
+        ipc_input_dir = NANOCLAW_DIR / "data" / "ipc" / folder / "input"
+        ipc_messages_dir = NANOCLAW_DIR / "data" / "ipc" / folder / "messages"
+        for f in ipc_input_dir.glob("*.json"):
+            f.unlink()
+        for f in ipc_messages_dir.glob("*.json"):
+            f.unlink()
+        close_file = ipc_input_dir / "_close"
+        if close_file.exists():
+            close_file.unlink()
+        dbg("Cleaned up stale IPC files")
+
+    # Build path to TypeScript interactive helper
+    ts_helper_path = NANOCLAW_DIR / "dist" / "claw-interactive.js"
+
+    if not ts_helper_path.exists():
+        print("error: claw-interactive.js not found. Run 'npm run build' first.", file=sys.stderr)
+        proc.kill()
+        sys.exit(1)
+
+    # Stream container stdout in background - parse and display nicely
+    def stream_stdout():
+        buffer = ""
+        for raw in proc.stdout:
+            line = raw.decode(errors="replace").rstrip()
+            dbg(f"stdout: {line}")
+
+            # Check for output markers
+            if "---NANOCLAW_OUTPUT_START---" in line:
+                buffer = line
+                continue
+            elif "---NANOCLAW_OUTPUT_END---" in line:
+                buffer += "\n" + line
+                # Parse the output
+                try:
+                    start = buffer.find("---NANOCLAW_OUTPUT_START---")
+                    end = buffer.find("---NANOCLAW_OUTPUT_END---")
+                    if start != -1 and end != -1:
+                        json_str = buffer[start + len("---NANOCLAW_OUTPUT_START---"):end].strip()
+                        data = json.loads(json_str)
+                        if data.get("status") == "success":
+                            result = data.get("result", "")
+                            if result:
+                                # Track turn count for compaction
+                                compaction_state['turn_count'] += 1
+                                dbg(f"Turn count: {compaction_state['turn_count']}")
+                                # Print response to terminal
+                                print(f"\nAndy: {result}", flush=True)
+                            # Signal response ready for TypeScript helper
+                            responses_dir = NANOCLAW_DIR / "data" / "ipc" / folder / "responses" if folder else None
+                            if responses_dir:
+                                responses_dir.mkdir(parents=True, exist_ok=True)
+                                resp_file = responses_dir / f"{time.time() * 1000:.0f}.json"
+                                resp_file.write_text(json.dumps({"status": "success", "result": result}))
+                        elif data.get("status") == "error":
+                            err_msg = data.get("error") or data.get("result") or "Unknown error"
+                            print(f"\n[Error] {err_msg}", flush=True)
+                            # Signal response ready for TypeScript helper
+                            responses_dir = NANOCLAW_DIR / "data" / "ipc" / folder / "responses" if folder else None
+                            if responses_dir:
+                                responses_dir.mkdir(parents=True, exist_ok=True)
+                                resp_file = responses_dir / f"{time.time() * 1000:.0f}.json"
+                                resp_file.write_text(json.dumps({"status": "error", "error": err_msg}))
+                except json.JSONDecodeError as e:
+                    dbg(f"JSON decode error: {e}")
+                buffer = ""
+                continue
+
+            if buffer:
+                buffer += "\n" + line
+
+    output_thread = threading.Thread(target=stream_stdout, daemon=True)
+    output_thread.start()
+
+    # Stream stderr - only show errors, not routine log lines
+    def stream_stderr():
+        for raw in proc.stderr:
+            line = raw.decode(errors="replace").rstrip()
+            if not line.startswith("npm notice"):
+                dbg(f"stderr: {line}")
+                # Only show actual errors, not routine [agent-runner] logs
+                if "error" in line.lower() and "[agent-runner]" not in line:
+                    print(line, file=sys.stderr, flush=True)
+
+    err_thread = threading.Thread(target=stream_stderr, daemon=True)
+    err_thread.start()
+
+    # IPC task processor - process task files written by container
+    def process_ipc_tasks():
+        while True:
+            time.sleep(2)  # Poll every 2 seconds
+            if folder:
+                tasks_dir = NANOCLAW_DIR / "data" / "ipc" / folder / "tasks"
+                if tasks_dir.exists():
+                    for task_file in tasks_dir.glob("*.json"):
+                        try:
+                            data = json.loads(task_file.read_text())
+                            dbg(f"IPC task: {data}")
+
+                            # Handle schedule_task
+                            if data.get("type") == "schedule_task":
+                                task_id = data.get("taskId", f"task-{int(time.time()*1000)}-{os.urandom(3).hex()}")
+                                chat_jid = data.get("chatJid") or data.get("targetJid") or jid
+                                task_prompt = data.get("prompt", "")
+                                schedule_type = data.get("schedule_type", "once")
+                                schedule_value = data.get("schedule_value", "0")
+                                context_mode = data.get("context_mode", "isolated")
+                                script = data.get("script")
+
+                                # Calculate next_run
+                                now = datetime.now(timezone.utc)
+                                if schedule_type == "interval":
+                                    interval_ms = int(schedule_value)
+                                    next_run = (now + __import__('datetime').timedelta(milliseconds=interval_ms)).isoformat()
+                                elif schedule_type == "cron":
+                                    # For cron, just set next_run to now (simplified)
+                                    next_run = now.isoformat()
+                                else:
+                                    next_run = now.isoformat()
+
+                                # Insert into database
+                                conn = sqlite3.connect(DB_PATH)
+                                conn.execute(
+                                    """INSERT OR REPLACE INTO scheduled_tasks
+                                       (id, group_folder, chat_jid, prompt, schedule_type, schedule_value,
+                                        next_run, status, created_at, context_mode, script)
+                                       VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)""",
+                                    (task_id, folder, chat_jid, task_prompt, schedule_type, schedule_value,
+                                     next_run, now.isoformat(), context_mode, script)
+                                )
+                                conn.commit()
+                                conn.close()
+                                dbg(f"Task created: {task_id}")
+                                print(f"\n[Task created: {task_id}]", flush=True)
+
+                            # Handle other task operations
+                            elif data.get("type") == "cancel_task":
+                                task_id = data.get("taskId")
+                                if task_id:
+                                    conn = sqlite3.connect(DB_PATH)
+                                    conn.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
+                                    conn.commit()
+                                    conn.close()
+                                    dbg(f"Task cancelled: {task_id}")
+                                    print(f"\n[Task cancelled: {task_id}]", flush=True)
+
+                            # Clean up processed file
+                            task_file.unlink()
+
+                        except Exception as e:
+                            dbg(f"Error processing IPC task: {e}")
+
+    ipc_task_thread = threading.Thread(target=process_ipc_tasks, daemon=True)
+    ipc_task_thread.start()
+    dbg("IPC task processor started")
+
+    # IPC messages watcher - display messages from agent's send_message MCP tool
+    def process_ipc_messages():
+        while True:
+            time.sleep(1)  # Poll every 1 second
+            if folder:
+                messages_dir = NANOCLAW_DIR / "data" / "ipc" / folder / "messages"
+                if messages_dir.exists():
+                    for msg_file in messages_dir.glob("*.json"):
+                        try:
+                            data = json.loads(msg_file.read_text())
+                            text = data.get("text", "")
+                            if text:
+                                # Display the message from the agent
+                                print(f"\nAndy: {text}", flush=True)
+                                # Signal response ready for TypeScript helper
+                                responses_dir = NANOCLAW_DIR / "data" / "ipc" / folder / "responses"
+                                if responses_dir:
+                                    responses_dir.mkdir(parents=True, exist_ok=True)
+                                    resp_file = responses_dir / f"{time.time() * 1000:.0f}.json"
+                                    resp_file.write_text(json.dumps({"status": "success", "result": text}))
+                            # Clean up processed file
+                            msg_file.unlink()
+                        except Exception as e:
+                            dbg(f"Error processing IPC message: {e}")
+
+    ipc_msg_thread = threading.Thread(target=process_ipc_messages, daemon=True)
+    ipc_msg_thread.start()
+    dbg("IPC messages watcher started")
+
+    # Task scheduler - poll for due tasks and forward to container via IPC
+    def task_scheduler():
+        SCHEDULER_POLL_INTERVAL = 5  # seconds
+        while True:
+            time.sleep(SCHEDULER_POLL_INTERVAL)
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                now = datetime.now(timezone.utc).isoformat()
+                due_tasks = conn.execute(
+                    "SELECT id, chat_jid, group_folder, prompt, script, schedule_type, schedule_value FROM scheduled_tasks "
+                    "WHERE status = 'active' AND next_run <= ?",
+                    (now,)
+                ).fetchall()
+                conn.close()
+
+                for task in due_tasks:
+                    task_id, chat_jid, group_folder, prompt_text, script, schedule_type, schedule_value = task
+                    # Only process tasks for the current group
+                    if folder and group_folder == folder:
+                        dbg(f"Task due: {task_id}")
+                        # Send task prompt via IPC
+                        input_dir = NANOCLAW_DIR / "data" / "ipc" / folder / "input"
+                        filename = f"{time.time() * 1000:.0f}-{task_id}.json"
+                        filepath = input_dir / filename
+                        # Atomic write: temp file then rename
+                        temp_path = input_dir / f"{filename}.tmp"
+                        task_prompt = f"[SCHEDULED TASK - {task_id}]\n{prompt_text}"
+                        temp_path.write_text(json.dumps({"type": "message", "text": task_prompt}))
+                        temp_path.rename(filepath)
+
+                        # Calculate next_run based on schedule_type and schedule_value
+                        if schedule_type == 'interval':
+                            interval_ms = int(schedule_value)
+                            next_run = datetime.now(timezone.utc) + __import__('datetime').timedelta(milliseconds=interval_ms)
+                        elif schedule_type == 'cron':
+                            # For cron, use a simplified approach: next run in 1 minute
+                            next_run = datetime.now(timezone.utc) + __import__('datetime').timedelta(minutes=1)
+                        else:
+                            # For 'once', don't reschedule (but mark as completed would be better)
+                            next_run = None
+
+                        conn = sqlite3.connect(DB_PATH)
+                        if next_run:
+                            conn.execute(
+                                "UPDATE scheduled_tasks SET next_run = ? WHERE id = ?",
+                                (next_run.isoformat(), task_id),
+                            )
+                        else:
+                            # For one-time tasks, mark as completed
+                            conn.execute(
+                                "UPDATE scheduled_tasks SET status = 'completed' WHERE id = ?",
+                                (task_id,),
+                            )
+                        conn.commit()
+                        conn.close()
+                        print(f"\n[Task {task_id} triggered]", flush=True)
+            except Exception as e:
+                dbg(f"Task scheduler error: {e}")
+
+    scheduler_thread = threading.Thread(target=task_scheduler, daemon=True)
+    scheduler_thread.start()
+    dbg("Task scheduler started")
+
+    # Start compaction monitor thread
+    if compaction_config.get('enabled', True) and folder:
+        ipc_path = NANOCLAW_DIR / "data" / "ipc" / folder
+        compaction_monitor_thread = threading.Thread(
+            target=compaction_monitor,
+            args=(folder, ipc_path, compaction_config, compaction_stop_event),
+            daemon=True
+        )
+        compaction_monitor_thread.start()
+        dbg("Compaction monitor started")
+
+    # Start TypeScript interactive helper as subprocess
+    ts_helper = subprocess.Popen(
+        ["node", str(ts_helper_path),
+         "--group", folder or "default",
+         "--ipc-dir", ipc_dir] + (["--verbose"] if VERBOSE else []),
+        stdin=sys.stdin,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+    )
+
+    # Wait for TypeScript helper to finish (user typed :exit or Ctrl+C)
+    ts_helper.wait()
+
+    # Stop compaction monitor thread
+    compaction_stop_event.set()
+
+    # Give container a moment to process _close sentinel
+    time.sleep(0.5)
+
+    # Stop container
+    dbg(f"stopping container {container_name}...")
+    try:
+        subprocess.run([runtime, "stop", "-t", "5", container_name],
+                       capture_output=True, timeout=10)
+        subprocess.run([runtime, "rm", container_name],
+                       capture_output=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+    proc.wait()
+    dbg(f"container exited (rc={proc.returncode})")
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="claw",
+        description="Run a NanoClaw agent from the command line.",
+    )
+    parser.add_argument("prompt", nargs="?", help="Prompt to send")
+    parser.add_argument("-g", "--group", help="Group name or folder (fuzzy match)")
+    parser.add_argument("-j", "--jid", help="Chat JID (exact)")
+    parser.add_argument("-s", "--session", help="Session ID to resume")
+    parser.add_argument("-p", "--pipe", action="store_true",
+                        help="Read prompt from stdin (can be combined with a prompt arg as prefix)")
+    parser.add_argument("--runtime", choices=["docker", "container"],
+                        help="Container runtime (default: auto-detect)")
+    parser.add_argument("--image", default=IMAGE, help=f"Container image (default: {IMAGE})")
+    parser.add_argument("--list-groups", action="store_true", help="List registered groups and exit")
+    parser.add_argument("--raw", action="store_true", help="Print raw JSON output")
+    parser.add_argument("--timeout", type=int, default=300, metavar="SECS",
+                        help="Max seconds to wait for a response (default: 300)")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Show debug info: cmd, payload (secrets redacted), stdout lines, exit code")
+    parser.add_argument("--persist-session", action="store_true",
+                        help="Save and resume session automatically (stored per group)")
+    parser.add_argument("-i", "--interactive", action="store_true",
+                        help="Start an interactive REPL session (keeps container alive)")
+    parser.add_argument("--chat", action="store_true",
+                        help="Start interactive mode without initial prompt (just start the session)")
+    parser.add_argument("--no-prompt", action="store_true",
+                        help="Start interactive session without sending initial prompt")
+    args = parser.parse_args()
+
+    global VERBOSE
+    VERBOSE = args.verbose
+
+    # Enable session persistence via env var (used by run_container)
+    if args.persist_session:
+        os.environ["CLAW_PERSIST_SESSION"] = "1"
+
+    groups = get_groups(DB_PATH) if DB_PATH.exists() else []
+
+    if args.list_groups:
+        print(f"{'NAME':<35} {'FOLDER':<30} {'JID'}")
+        print("-" * 100)
+        for g in groups:
+            main_tag = " [main]" if g["is_main"] else ""
+            print(f"{g['name']:<35} {g['folder']:<30} {g['jid']}{main_tag}")
+        return
+
+    # Resolve prompt:
+    # - For interactive mode (-i): use default greeting unless positional arg is given
+    # - For one-shot mode: read from stdin if --pipe or stdin is not a tty
+    if args.interactive:
+        # Interactive mode: positional arg is the initial prompt, otherwise use default
+        prompt = args.prompt if args.prompt else "Hello, I'm ready to chat."
+    else:
+        # One-shot mode: handle stdin
+        if args.pipe or (not sys.stdin.isatty() and not args.prompt):
+            stdin_text = sys.stdin.read().strip()
+            if args.prompt:
+                prompt = f"{args.prompt}\n\n{stdin_text}"
+            else:
+                prompt = stdin_text
+        else:
+            prompt = args.prompt
+
+    if not prompt:
+        prompt = "Hello, I'm ready to chat."
+
+    # Resolve group → jid
+    jid = args.jid
+    group_name = None
+    group_folder = None
+    is_main = False
+
+    if args.group:
+        g = find_group(groups, args.group)
+        if g is None:
+            sys.exit(f"error: group '{args.group}' not found. Run --list-groups to see options.")
+        jid = g["jid"]
+        group_name = g["name"]
+        group_folder = g["folder"]
+        is_main = g["is_main"]
+    elif not jid:
+        # Default: main group
+        mains = [g for g in groups if g["is_main"]]
+        if mains:
+            jid = mains[0]["jid"]
+            group_name = mains[0]["name"]
+            group_folder = mains[0]["folder"]
+            is_main = True
+        else:
+            sys.exit("error: no group specified and no main group found. Use -g or -j.")
+
+    runtime = detect_runtime(args.runtime)
+    secrets = read_secrets(ENV_FILE)
+
+    if not secrets:
+        print("warning: no secrets found in .env — agent may not be authenticated", file=sys.stderr)
+
+    # Auto-load saved session if persistence is enabled and no explicit session
+    session_id = args.session
+    if args.persist_session and not session_id and group_folder:
+        saved = load_session(group_folder)
+        if saved:
+            session_id = saved
+            dbg(f"resuming saved session: {session_id}")
+
+    payload: dict = {
+        "prompt": prompt,
+        "chatJid": jid,
+        "isMain": is_main,
+        "secrets": secrets,
+    }
+    if group_name:
+        payload["groupFolder"] = group_name
+    if session_id:
+        payload["sessionId"] = session_id
+        payload["resumeAt"] = "latest"
+
+    print(f"[{group_name or jid}] running via {runtime}...", file=sys.stderr)
+
+    if args.interactive:
+        run_interactive_container(runtime, args.image, payload,
+                                  folder=group_folder, is_main=is_main,
+                                  timeout=args.timeout, persist_session=args.persist_session)
+    else:
+        run_container(runtime, args.image, payload,
+                      folder=group_folder, is_main=is_main,
+                      timeout=args.timeout, persist_session=args.persist_session)
+
+
+if __name__ == "__main__":
+    main()
